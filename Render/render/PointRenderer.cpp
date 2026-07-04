@@ -5,6 +5,17 @@
 #include <limits>
 #include <vector>
 
+static constexpr float SH_C0 = 0.28209479177387814f;
+static constexpr float SH_C1 = 0.4886025119029199f;
+
+static constexpr float SH_C2[5] = {1.0925484305920792f, -1.0925484305920792f,
+                                   0.31539156525252005f, -1.0925484305920792f,
+                                   0.5462742152960396f};
+
+static constexpr float SH_C3[7] = {-0.5900435899266435f, 2.890611442640554f,
+                                   -0.4570457994644658f, 0.3731763325901154f,
+                                   -0.4570457994644658f, 1.445305721320277f,
+                                   -0.5900435899266435f};
 
 // 投影到屏幕后的3D点
 struct ProjectedPoint {
@@ -20,7 +31,7 @@ struct ProjectedPoint {
   int radiusY = 1;
 
   // 2D 椭圆核最关键的参数
-  // quad = A*dx^2 + 2B*dx*dy + C*dy^2 
+  // quad = A*dx^2 + 2B*dx*dy + C*dy^2
   // 椭圆度量:某个像素相对椭圆中心的“距离”
   float conicA = 1.0f;
   float conicB = 0.0f;
@@ -29,6 +40,41 @@ struct ProjectedPoint {
   Eigen::Vector3f color = Eigen::Vector3f::Ones();
   float opacity = 1.0f;
 };
+
+static float EvalSHChannel(const float* sh, const Eigen::Vector3f& dir) {
+  const float x = dir.x();
+  const float y = dir.y();
+  const float z = dir.z();
+
+  float result = SH_C0 * sh[0];
+
+  result += -SH_C1 * y * sh[1];
+  result += SH_C1 * z * sh[2];
+  result += -SH_C1 * x * sh[3];
+
+  const float xx = x * x;
+  const float yy = y * y;
+  const float zz = z * z;
+  const float xy = x * y;
+  const float yz = y * z;
+  const float xz = x * z;
+
+  result += SH_C2[0] * xy * sh[4];
+  result += SH_C2[1] * yz * sh[5];
+  result += SH_C2[2] * (2.0f * zz - xx - yy) * sh[6];
+  result += SH_C2[3] * xz * sh[7];
+  result += SH_C2[4] * (xx - yy) * sh[8];
+
+  result += SH_C3[0] * y * (3.0f * xx - yy) * sh[9];
+  result += SH_C3[1] * xy * z * sh[10];
+  result += SH_C3[2] * y * (4.0f * zz - xx - yy) * sh[11];
+  result += SH_C3[3] * z * (2.0f * zz - 3.0f * xx - 3.0f * yy) * sh[12];
+  result += SH_C3[4] * x * (4.0f * zz - xx - yy) * sh[13];
+  result += SH_C3[5] * z * (xx - yy) * sh[14];
+  result += SH_C3[6] * x * (xx - 3.0f * yy) * sh[15];
+
+  return result;
+}
 
 // 四元数转旋转矩阵
 static Eigen::Matrix3f QuaternionToMatrix(const Eigen::Vector4f& qInput) {
@@ -52,6 +98,20 @@ static Eigen::Matrix3f QuaternionToMatrix(const Eigen::Vector4f& qInput) {
   R(2, 1) = 2.0f * (y * z + w * x);
   R(2, 2) = 1.0f - 2.0f * (x * x + y * y);
   return R;
+}
+
+static Eigen::Vector3f EvalSHColor(const std::array<float, 48>& sh,
+                                   const Eigen::Vector3f& dir) {
+  Eigen::Vector3f color;
+  color.x() = EvalSHChannel(&sh[0], dir);
+  color.y() = EvalSHChannel(&sh[16], dir);
+  color.z() = EvalSHChannel(&sh[32], dir);
+
+  // 对齐官方：+0.5 再 clamp
+  color.array() += 0.5f;
+  color = color.cwiseMax(0.0f);
+  color = color.cwiseMin(1.0f);
+  return color;
 }
 
 // 计算3D协方差矩阵，Gaussian 在 3D 空间里的“形状描述”
@@ -81,6 +141,10 @@ cv::Mat PointRenderer::Render(const PointCloud& cloud,
       camera.fovYDegrees * 3.14159265358979323846f / 180.0f;
   const float focalPixels =
       static_cast<float>(camera.height) / (2.0f * std::tan(fovYRadians * 0.5f));
+
+  // SH 需要世界空间里，从相机指向点的方向
+  const Eigen::Matrix4f invView = camera.view.inverse();
+  const Eigen::Vector3f cameraCenter = invView.block<3, 1>(0, 3);
 
   std::vector<ProjectedPoint> projected;
   projected.reserve(cloud.points.size());
@@ -169,11 +233,19 @@ cv::Mat PointRenderer::Render(const PointCloud& cloud,
     const int bboxRadius = std::clamp(
         static_cast<int>(std::ceil(3.0f * std::sqrt(lambdaMax))), 1, 64);
 
+    // 计算 SH 颜色
+    Eigen::Vector3f viewDir = point.position - cameraCenter;
+    if (viewDir.norm() < 1e-8f) {
+      continue;
+    }
+    viewDir.normalize();
+    const Eigen::Vector3f shColor = EvalSHColor(point.sh, viewDir);
+
     // 收集成 projected 列表
     ProjectedPoint p;
     p.px = px;
     p.py = py;
-    p.depth = ndc.z();
+    p.depth = std::abs(viewPos.z());
     p.radiusX = bboxRadius;
     p.radiusY = bboxRadius;
     p.conicA = conicA;

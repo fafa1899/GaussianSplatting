@@ -9,6 +9,7 @@ struct Point3D {
   float opacity = 1.0f;
   Eigen::Vector3f scale = Eigen::Vector3f::Ones();
   Eigen::Vector4f rotation = Eigen::Vector4f(1.0f, 0.0f, 0.0f, 0.0f);
+  std::array<float, 48> sh{};  // 每个颜色通道 16 个 SH 系数，总共 48 个
 };
 
 class PointCloud {

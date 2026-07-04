@@ -149,11 +149,17 @@ PointCloud PlyLoader::LoadPointCloud(const std::string& path) {
         gaussianCloud[vertex].rot[0], gaussianCloud[vertex].rot[1],
         gaussianCloud[vertex].rot[2], gaussianCloud[vertex].rot[3]);
 
-    // if (vertex < 100) {
-    //  printf("%lf\t%lf\t%lf\n", gaussianCloud[vertex].x,
-    //         gaussianCloud[vertex].y, gaussianCloud[vertex].z);
-    // printf("%lf\t", cloud.points[vertex].opacity);
-    //}
+    auto& sh = cloud.points[vertex].sh;
+    // 先放 DC
+    sh[0] = gaussianCloud[vertex].f_dc[0];
+    sh[16] = gaussianCloud[vertex].f_dc[1];
+    sh[32] = gaussianCloud[vertex].f_dc[2];
+    // 再放 rest
+    for (int i = 0; i < 15; ++i) {
+      sh[1 + i] = gaussianCloud[vertex].f_rest[i];
+      sh[16 + 1 + i] = gaussianCloud[vertex].f_rest[15 + i];
+      sh[32 + 1 + i] = gaussianCloud[vertex].f_rest[30 + i];
+    }
   }
 
   return cloud;
