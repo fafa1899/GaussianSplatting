@@ -18,7 +18,7 @@ static constexpr float SH_C3[7] = {-0.5900435899266435f, 2.890611442640554f,
                                    -0.5900435899266435f};
 
 // 投影到屏幕后的3D点
-struct ProjectedPoint {
+struct ProjectedGaussian {
   // 椭圆中心的屏幕坐标
   int px = 0;
   int py = 0;
@@ -127,12 +127,8 @@ static Eigen::Matrix3f BuildWorldCovariance(const Eigen::Vector3f& scale,
   return M.transpose() * M;
 }
 
-cv::Mat PointRenderer::Render(const PointCloud& cloud,
-                              const Camera& camera) const {
-  // 使用浮点型进行计算
-  cv::Mat image(camera.height, camera.width, CV_32FC3,
-                cv::Scalar(20.0f / 255.0f, 20.0f / 255.0f, 20.0f / 255.0f));
-
+static std::vector<ProjectedGaussian> PreprocessGaussians(
+    const PointCloud& cloud, const Camera& camera) {
   // 视图投影矩阵
   const Eigen::Matrix4f viewProj = camera.proj * camera.view;
 
@@ -146,7 +142,7 @@ cv::Mat PointRenderer::Render(const PointCloud& cloud,
   const Eigen::Matrix4f invView = camera.view.inverse();
   const Eigen::Vector3f cameraCenter = invView.block<3, 1>(0, 3);
 
-  std::vector<ProjectedPoint> projected;
+  std::vector<ProjectedGaussian> projected;
   projected.reserve(cloud.points.size());
 
   // 逐个 3D Gaussian 做预处理
@@ -242,7 +238,7 @@ cv::Mat PointRenderer::Render(const PointCloud& cloud,
     const Eigen::Vector3f shColor = EvalSHColor(point.sh, viewDir);
 
     // 收集成 projected 列表
-    ProjectedPoint p;
+    ProjectedGaussian p;
     p.px = px;
     p.py = py;
     p.depth = std::abs(viewPos.z());
@@ -251,19 +247,29 @@ cv::Mat PointRenderer::Render(const PointCloud& cloud,
     p.conicA = conicA;
     p.conicB = conicB;
     p.conicC = conicC;
-    p.color = point.color;
+    p.color = shColor;
     p.opacity = point.opacity;
     projected.push_back(p);
   }
 
-  // 深度排序
-  std::sort(projected.begin(), projected.end(),
-            [](const ProjectedPoint& a, const ProjectedPoint& b) {
+  return projected;
+}
+
+// 深度排序
+static void SortGaussiansByDepth(std::vector<ProjectedGaussian>& gaussians) {
+  std::sort(gaussians.begin(), gaussians.end(),
+            [](const ProjectedGaussian& a, const ProjectedGaussian& b) {
               return a.depth > b.depth;
             });
+}
+
+static cv::Mat RasterizeGaussians(
+    const std::vector<ProjectedGaussian>& gaussians, const Camera& camera) {
+  cv::Mat image(camera.height, camera.width, CV_32FC3,
+                cv::Scalar(20.0f / 255.0f, 20.0f / 255.0f, 20.0f / 255.0f));
 
   // 逐个椭圆 splat 到图像
-  for (const ProjectedPoint& point : projected) {
+  for (const ProjectedGaussian& point : gaussians) {
     // 先取 bbox 范围
     const int minX = std::max(0, point.px - point.radiusX);
     const int maxX = std::min(camera.width - 1, point.px + point.radiusX);
@@ -312,4 +318,13 @@ cv::Mat PointRenderer::Render(const PointCloud& cloud,
   cv::Mat output;
   image.convertTo(output, CV_8UC3, 255.0);
   return output;
+}
+
+cv::Mat PointRenderer::Render(const PointCloud& cloud,
+                              const Camera& camera) const {
+  std::vector<ProjectedGaussian> projected = PreprocessGaussians(cloud, camera);
+
+  SortGaussiansByDepth(projected);
+
+  return RasterizeGaussians(projected, camera);
 }
