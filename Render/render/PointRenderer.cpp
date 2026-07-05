@@ -5,6 +5,8 @@
 #include <limits>
 #include <vector>
 
+static constexpr int kDebugPrintProjectedCount = 12;
+
 static constexpr float SH_C0 = 0.28209479177387814f;
 static constexpr float SH_C1 = 0.4886025119029199f;
 
@@ -168,6 +170,8 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
   std::vector<ProjectedGaussian> projected;
   projected.reserve(cloud.points.size());
 
+  int debugPrinted = 0;
+
   // 逐个 3D Gaussian 做预处理
   for (const Point3D& point : cloud.points) {
     // 投影到裁剪空间
@@ -198,7 +202,7 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
 
     // 世界高斯转到相机空间
     const Eigen::Vector4f viewPos4 = camera.view * world;
-    const Eigen::Vector3f viewPos = viewPos4.head<3>();
+    Eigen::Vector3f viewPos = viewPos4.head<3>();
 
     // 世界协方差
     const Eigen::Matrix3f covWorld =
@@ -207,6 +211,22 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     // 相机协方差
     const Eigen::Matrix3f viewRot = camera.view.block<3, 3>(0, 0);
     const Eigen::Matrix3f covView = viewRot * covWorld * viewRot.transpose();
+
+    // 对齐官方 computeCov2D：
+    // 先在相机空间限制 x/z 和 y/z 的斜率，避免极端透视把椭圆拉爆。
+    const float tanFovY = std::tan(fovYRadians * 0.5f);
+    const float tanFovX = tanFovY * static_cast<float>(camera.width) /
+                          static_cast<float>(camera.height);
+
+    const float limx = 1.3f * tanFovX;
+    const float limy = 1.3f * tanFovY;
+
+    const float safeZ = std::max(std::abs(viewPos.z()), 1e-4f);
+    const float txtz = viewPos.x() / safeZ;
+    const float tytz = viewPos.y() / safeZ;
+
+    viewPos.x() = std::min(limx, std::max(-limx, txtz)) * safeZ;
+    viewPos.y() = std::min(limy, std::max(-limy, tytz)) * safeZ;
 
     // 投影 Jacobian
     const float z = std::max(std::abs(viewPos.z()), 1e-4f);
@@ -225,14 +245,25 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     // 3D 协方差投影成 2D 协方差
     Eigen::Matrix2f cov2D = J * covView * J.transpose();
 
+    // 对齐官方思路：先记录加稳定项前的 determinant
+    const float detBefore = cov2D.determinant();
+
     // 数值稳定项，避免协方差过小或退化
     cov2D(0, 0) += 0.3f;
     cov2D(1, 1) += 0.3f;
 
-    const float det = cov2D.determinant();
-    if (det <= 1e-8f) {
+    const float detAfter =
+        cov2D(0, 0) * cov2D(1, 1) - cov2D(0, 1) * cov2D(1, 0);
+    if (detAfter <= 1e-8f) {
       ++stats.clippedDegenerateCov;
       continue;
+    }
+
+    // 对齐官方 antialiasing / h_convolution_scaling 的思路：
+    // 稳定项把核摊大之后，适当缩小 opacity，避免能量过度扩散
+    float opacityScale = 1.0f;
+    if (detBefore > 1e-8f) {
+      opacityScale = std::sqrt(std::max(0.000025f, detBefore / detAfter));
     }
 
     // 协方差逆矩阵：得到 conic
@@ -242,17 +273,20 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     const float conicB = invCov2D(0, 1);
     const float conicC = invCov2D(1, 1);
 
-    // 用特征值估一个 bbox
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> solver(cov2D);
-    if (solver.info() != Eigen::Success) {
-      ++stats.clippedBadEigen;
-      continue;
-    }
+    // 对齐官方 forward.cu：
+    // cov2D = [a b; b c]
+    const float a = cov2D(0, 0);
+    const float b = cov2D(0, 1);
+    const float c = cov2D(1, 1);
 
-    const Eigen::Vector2f eigenValues = solver.eigenvalues();
-    const float lambdaMax = std::max(eigenValues.x(), eigenValues.y());
+    const float mid = 0.5f * (a + c);
+    const float discr = std::max(0.1f, mid * mid - detAfter);
 
-    // 先用统一 bbox 半径，保证包得住椭圆
+    const float lambda1 = mid + std::sqrt(discr);
+    const float lambda2 = mid - std::sqrt(discr);
+    const float lambdaMax = std::max(lambda1, lambda2);
+
+    // 仍然保留 bbox 上限，避免个别高斯失控
     const int bboxRadius = std::clamp(
         static_cast<int>(std::ceil(3.0f * std::sqrt(lambdaMax))), 1, 64);
 
@@ -265,6 +299,15 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     const Eigen::Vector3f shColor = EvalSHColor(point.sh, viewDir);
 
     //
+    // const float finalOpacity =
+    //    std::clamp(point.opacity * opacityScale, 0.0f, 1.0f);
+    const float opacityScaleBlend = 0.5f;
+    const float blendedOpacityScale =
+        1.0f + (opacityScale - 1.0f) * opacityScaleBlend;
+    const float finalOpacity =
+        std::clamp(point.opacity * blendedOpacityScale, 0.0f, 1.0f);
+
+    //
     ++stats.projectedCount;
 
     stats.minBBox = std::min(stats.minBBox, bboxRadius);
@@ -275,9 +318,32 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     if (bboxRadius >= 32) ++stats.bboxGe32;
     if (bboxRadius >= 64) ++stats.bboxGe64;
 
-    stats.minOpacity = std::min(stats.minOpacity, point.opacity);
-    stats.maxOpacity = std::max(stats.maxOpacity, point.opacity);
-    stats.sumOpacity += static_cast<double>(point.opacity);
+    stats.minOpacity = std::min(stats.minOpacity, finalOpacity);
+    stats.maxOpacity = std::max(stats.maxOpacity, finalOpacity);
+    stats.sumOpacity += static_cast<double>(finalOpacity);
+
+    if (debugPrinted < kDebugPrintProjectedCount) {
+      std::cout << "---- Projected Gaussian #" << debugPrinted << " ----"
+                << std::endl;
+      std::cout << "viewPos: " << viewPos.transpose() << std::endl;
+      std::cout << "cov2D:\n" << cov2D << std::endl;
+      std::cout << "conic: (" << conicA << ", " << conicB << ", " << conicC
+                << ")" << std::endl;
+      std::cout << "bboxRadius: " << bboxRadius << std::endl;
+      std::cout << "opacity raw/final: " << point.opacity << " / "
+                << finalOpacity << std::endl;
+      std::cout << "screen px/py: " << px << ", " << py << std::endl;
+      std::cout << std::endl;
+      ++debugPrinted;
+    }
+
+    //if (bboxRadius == 64) {
+    //  std::cout << "[LargeBBox] "
+    //            << "bbox=" << bboxRadius << " viewPos=" << viewPos.transpose()
+    //            << " opacity=" << finalOpacity << " conic=(" << conicA << ", "
+    //            << conicB << ", " << conicC << ")"
+    //            << " px/py=(" << px << ", " << py << ")" << std::endl;
+    //}
 
     // 收集成 projected 列表
     ProjectedGaussian p;
@@ -290,7 +356,7 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     p.conicB = conicB;
     p.conicC = conicC;
     p.color = shColor;
-    p.opacity = point.opacity;
+    p.opacity = finalOpacity;
     projected.push_back(p);
   }
 
