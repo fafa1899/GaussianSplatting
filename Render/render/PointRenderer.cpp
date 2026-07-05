@@ -41,6 +41,27 @@ struct ProjectedGaussian {
   float opacity = 1.0f;
 };
 
+struct PreprocessStats {
+  size_t totalInput = 0;
+  size_t clippedBehindCamera = 0;
+  size_t clippedOutsideNdc = 0;
+  size_t clippedDegenerateCov = 0;
+  size_t clippedBadEigen = 0;
+  size_t projectedCount = 0;
+
+  int minBBox = std::numeric_limits<int>::max();
+  int maxBBox = 0;
+  double sumBBox = 0.0;
+
+  size_t bboxGe16 = 0;
+  size_t bboxGe32 = 0;
+  size_t bboxGe64 = 0;
+
+  float minOpacity = std::numeric_limits<float>::max();
+  float maxOpacity = 0.0f;
+  double sumOpacity = 0.0;
+};
+
 static float EvalSHChannel(const float* sh, const Eigen::Vector3f& dir) {
   const float x = dir.x();
   const float y = dir.y();
@@ -128,7 +149,9 @@ static Eigen::Matrix3f BuildWorldCovariance(const Eigen::Vector3f& scale,
 }
 
 static std::vector<ProjectedGaussian> PreprocessGaussians(
-    const PointCloud& cloud, const Camera& camera) {
+    const PointCloud& cloud, const Camera& camera, PreprocessStats& stats) {
+  stats.totalInput = cloud.points.size();
+
   // 视图投影矩阵
   const Eigen::Matrix4f viewProj = camera.proj * camera.view;
 
@@ -152,6 +175,7 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
                           point.position.z(), 1.0f);
     Eigen::Vector4f clip = viewProj * world;
     if (clip.w() <= 0.0f) {
+      ++stats.clippedBehindCamera;
       continue;
     }
 
@@ -159,6 +183,7 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     Eigen::Vector3f ndc = clip.head<3>() / clip.w();
     if (ndc.x() < -1.0f || ndc.x() > 1.0f || ndc.y() < -1.0f ||
         ndc.y() > 1.0f || ndc.z() < -1.0f || ndc.z() > 1.0f) {
+      ++stats.clippedOutsideNdc;
       continue;
     }
 
@@ -206,6 +231,7 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
 
     const float det = cov2D.determinant();
     if (det <= 1e-8f) {
+      ++stats.clippedDegenerateCov;
       continue;
     }
 
@@ -219,6 +245,7 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     // 用特征值估一个 bbox
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> solver(cov2D);
     if (solver.info() != Eigen::Success) {
+      ++stats.clippedBadEigen;
       continue;
     }
 
@@ -236,6 +263,21 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     }
     viewDir.normalize();
     const Eigen::Vector3f shColor = EvalSHColor(point.sh, viewDir);
+
+    //
+    ++stats.projectedCount;
+
+    stats.minBBox = std::min(stats.minBBox, bboxRadius);
+    stats.maxBBox = std::max(stats.maxBBox, bboxRadius);
+    stats.sumBBox += static_cast<double>(bboxRadius);
+
+    if (bboxRadius >= 16) ++stats.bboxGe16;
+    if (bboxRadius >= 32) ++stats.bboxGe32;
+    if (bboxRadius >= 64) ++stats.bboxGe64;
+
+    stats.minOpacity = std::min(stats.minOpacity, point.opacity);
+    stats.maxOpacity = std::max(stats.maxOpacity, point.opacity);
+    stats.sumOpacity += static_cast<double>(point.opacity);
 
     // 收集成 projected 列表
     ProjectedGaussian p;
@@ -322,7 +364,34 @@ static cv::Mat RasterizeGaussians(
 
 cv::Mat PointRenderer::Render(const PointCloud& cloud,
                               const Camera& camera) const {
-  std::vector<ProjectedGaussian> projected = PreprocessGaussians(cloud, camera);
+  PreprocessStats stats;
+
+  std::vector<ProjectedGaussian> projected =
+      PreprocessGaussians(cloud, camera, stats);
+
+  std::cout << "=== Preprocess Stats ===" << std::endl;
+  std::cout << "Input: " << stats.totalInput << std::endl;
+  std::cout << "Projected: " << stats.projectedCount << std::endl;
+  std::cout << "Behind camera: " << stats.clippedBehindCamera << std::endl;
+  std::cout << "Outside NDC: " << stats.clippedOutsideNdc << std::endl;
+  std::cout << "Degenerate cov: " << stats.clippedDegenerateCov << std::endl;
+  std::cout << "Bad eigen: " << stats.clippedBadEigen << std::endl;
+
+  if (stats.projectedCount > 0) {
+    std::cout << "BBox min/max/avg: " << stats.minBBox << " / " << stats.maxBBox
+              << " / "
+              << (stats.sumBBox / static_cast<double>(stats.projectedCount))
+              << std::endl;
+
+    std::cout << "BBox >=16: " << stats.bboxGe16 << std::endl;
+    std::cout << "BBox >=32: " << stats.bboxGe32 << std::endl;
+    std::cout << "BBox >=64: " << stats.bboxGe64 << std::endl;
+
+    std::cout << "Opacity min/max/avg: " << stats.minOpacity << " / "
+              << stats.maxOpacity << " / "
+              << (stats.sumOpacity / static_cast<double>(stats.projectedCount))
+              << std::endl;
+  }
 
   SortGaussiansByDepth(projected);
 
