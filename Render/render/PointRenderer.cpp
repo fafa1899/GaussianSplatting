@@ -5,8 +5,6 @@
 #include <limits>
 #include <vector>
 
-static constexpr int kDebugPrintProjectedCount = 12;
-
 static constexpr float SH_C0 = 0.28209479177387814f;
 static constexpr float SH_C1 = 0.4886025119029199f;
 
@@ -18,6 +16,21 @@ static constexpr float SH_C3[7] = {-0.5900435899266435f, 2.890611442640554f,
                                    -0.4570457994644658f, 0.3731763325901154f,
                                    -0.4570457994644658f, 1.445305721320277f,
                                    -0.5900435899266435f};
+
+static constexpr int kTileWidth = 16;
+static constexpr int kTileHeight = 16;
+
+struct TileEntry {
+  int tileId = 0;
+  int gaussianIndex = 0;
+  float depth = 0.0f;
+};
+
+struct TileRange {
+  int begin = 0;
+  int end = 0;
+  bool valid = false;
+};
 
 // 投影到屏幕后的3D点
 struct ProjectedGaussian {
@@ -322,29 +335,6 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     stats.maxOpacity = std::max(stats.maxOpacity, finalOpacity);
     stats.sumOpacity += static_cast<double>(finalOpacity);
 
-    if (debugPrinted < kDebugPrintProjectedCount) {
-      std::cout << "---- Projected Gaussian #" << debugPrinted << " ----"
-                << std::endl;
-      std::cout << "viewPos: " << viewPos.transpose() << std::endl;
-      std::cout << "cov2D:\n" << cov2D << std::endl;
-      std::cout << "conic: (" << conicA << ", " << conicB << ", " << conicC
-                << ")" << std::endl;
-      std::cout << "bboxRadius: " << bboxRadius << std::endl;
-      std::cout << "opacity raw/final: " << point.opacity << " / "
-                << finalOpacity << std::endl;
-      std::cout << "screen px/py: " << px << ", " << py << std::endl;
-      std::cout << std::endl;
-      ++debugPrinted;
-    }
-
-    //if (bboxRadius == 64) {
-    //  std::cout << "[LargeBBox] "
-    //            << "bbox=" << bboxRadius << " viewPos=" << viewPos.transpose()
-    //            << " opacity=" << finalOpacity << " conic=(" << conicA << ", "
-    //            << conicB << ", " << conicC << ")"
-    //            << " px/py=(" << px << ", " << py << ")" << std::endl;
-    //}
-
     // 收集成 projected 列表
     ProjectedGaussian p;
     p.px = px;
@@ -428,6 +418,152 @@ static cv::Mat RasterizeGaussians(
   return output;
 }
 
+static std::vector<TileEntry> BuildTileEntries(
+    const std::vector<ProjectedGaussian>& gaussians, const Camera& camera) {
+  const int tileCountX = (camera.width + kTileWidth - 1) / kTileWidth;
+  const int tileCountY = (camera.height + kTileHeight - 1) / kTileHeight;
+
+  std::vector<TileEntry> entries;
+  entries.reserve(gaussians.size() * 4);  // 先给个保守初值，后面可以调
+
+  for (int i = 0; i < static_cast<int>(gaussians.size()); ++i) {
+    const ProjectedGaussian& g = gaussians[i];
+
+    const int minX = std::max(0, g.px - g.radiusX);
+    const int maxX = std::min(camera.width - 1, g.px + g.radiusX);
+    const int minY = std::max(0, g.py - g.radiusY);
+    const int maxY = std::min(camera.height - 1, g.py + g.radiusY);
+
+    const int tileMinX = std::max(0, minX / kTileWidth);
+    const int tileMaxX = std::min(tileCountX - 1, maxX / kTileWidth);
+    const int tileMinY = std::max(0, minY / kTileHeight);
+    const int tileMaxY = std::min(tileCountY - 1, maxY / kTileHeight);
+
+    for (int ty = tileMinY; ty <= tileMaxY; ++ty) {
+      for (int tx = tileMinX; tx <= tileMaxX; ++tx) {
+        TileEntry e;
+        e.tileId = ty * tileCountX + tx;
+        e.gaussianIndex = i;
+        e.depth = g.depth;
+        entries.push_back(e);
+      }
+    }
+  }
+
+  return entries;
+}
+
+static std::vector<TileRange> BuildTileRanges(std::vector<TileEntry>& entries,
+                                              const Camera& camera) {
+  const int tileCountX = (camera.width + kTileWidth - 1) / kTileWidth;
+  const int tileCountY = (camera.height + kTileHeight - 1) / kTileHeight;
+  const int tileCount = tileCountX * tileCountY;
+
+  std::sort(entries.begin(), entries.end(),
+            [](const TileEntry& a, const TileEntry& b) {
+              if (a.tileId != b.tileId) {
+                return a.tileId < b.tileId;
+              }
+              return a.depth > b.depth;  // 远到近
+            });
+
+  std::vector<TileRange> ranges(tileCount);
+
+  if (entries.empty()) {
+    return ranges;
+  }
+
+  int currentTile = entries[0].tileId;
+  ranges[currentTile].begin = 0;
+  ranges[currentTile].valid = true;
+
+  for (int i = 1; i < static_cast<int>(entries.size()); ++i) {
+    const int prevTile = entries[i - 1].tileId;
+    const int currTile = entries[i].tileId;
+
+    if (currTile != prevTile) {
+      ranges[prevTile].end = i;
+      ranges[currTile].begin = i;
+      ranges[currTile].valid = true;
+    }
+  }
+
+  ranges[entries.back().tileId].end = static_cast<int>(entries.size());
+  return ranges;
+}
+
+static cv::Mat RasterizeTiles(const std::vector<ProjectedGaussian>& gaussians,
+                              const std::vector<TileEntry>& entries,
+                              const std::vector<TileRange>& ranges,
+                              const Camera& camera) {
+  cv::Mat image(camera.height, camera.width, CV_32FC3,
+                cv::Scalar(20.0f / 255.0f, 20.0f / 255.0f, 20.0f / 255.0f));
+
+  const int tileCountX = (camera.width + kTileWidth - 1) / kTileWidth;
+  const int tileCountY = (camera.height + kTileHeight - 1) / kTileHeight;
+
+  for (int ty = 0; ty < tileCountY; ++ty) {
+    for (int tx = 0; tx < tileCountX; ++tx) {
+      const int tileId = ty * tileCountX + tx;
+      const TileRange& range = ranges[tileId];
+      if (!range.valid) {
+        continue;
+      }
+
+      const int tileMinX = tx * kTileWidth;
+      const int tileMaxX = std::min(camera.width, tileMinX + kTileWidth);
+      const int tileMinY = ty * kTileHeight;
+      const int tileMaxY = std::min(camera.height, tileMinY + kTileHeight);
+
+      for (int ei = range.begin; ei < range.end; ++ei) {
+        const ProjectedGaussian& point = gaussians[entries[ei].gaussianIndex];
+
+        const int minX = std::max(tileMinX, point.px - point.radiusX);
+        const int maxX = std::min(tileMaxX - 1, point.px + point.radiusX);
+        const int minY = std::max(tileMinY, point.py - point.radiusY);
+        const int maxY = std::min(tileMaxY - 1, point.py + point.radiusY);
+
+        const float alpha = std::clamp(point.opacity, 0.0f, 1.0f);
+        const cv::Vec3f srcColor(point.color.z(), point.color.y(),
+                                 point.color.x());
+
+        for (int y = minY; y <= maxY; ++y) {
+          for (int x = minX; x <= maxX; ++x) {
+            const float dx = static_cast<float>(x - point.px);
+            const float dy = static_cast<float>(y - point.py);
+
+            const float quad = point.conicA * dx * dx +
+                               2.0f * point.conicB * dx * dy +
+                               point.conicC * dy * dy;
+
+            const float power = -0.5f * quad;
+            if (power < -12.0f) {
+              continue;
+            }
+
+            const float weight = std::exp(power);
+            if (weight < 1e-4f) {
+              continue;
+            }
+
+            const float localAlpha = alpha * weight;
+            if (localAlpha <= 1e-4f) {
+              continue;
+            }
+
+            cv::Vec3f& dst = image.at<cv::Vec3f>(y, x);
+            dst = srcColor * localAlpha + dst * (1.0f - localAlpha);
+          }
+        }
+      }
+    }
+  }
+
+  cv::Mat output;
+  image.convertTo(output, CV_8UC3, 255.0);
+  return output;
+}
+
 cv::Mat PointRenderer::Render(const PointCloud& cloud,
                               const Camera& camera) const {
   PreprocessStats stats;
@@ -459,7 +595,14 @@ cv::Mat PointRenderer::Render(const PointCloud& cloud,
               << std::endl;
   }
 
-  SortGaussiansByDepth(projected);
+  // SortGaussiansByDepth(projected);
 
-  return RasterizeGaussians(projected, camera);
+  // return RasterizeGaussians(projected, camera);
+
+  std::vector<TileEntry> entries = BuildTileEntries(projected, camera);
+  std::vector<TileRange> ranges = BuildTileRanges(entries, camera);
+
+  std::cout << "Tile entries: " << entries.size() << std::endl;
+
+  return RasterizeTiles(projected, entries, ranges, camera);
 }
