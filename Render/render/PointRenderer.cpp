@@ -35,8 +35,8 @@ struct TileRange {
 // 投影到屏幕后的3D点
 struct ProjectedGaussian {
   // 椭圆中心的屏幕坐标
-  int px = 0;
-  int py = 0;
+  float px = 0;
+  float py = 0;
 
   // 深度，用于排序，决定先画远处还是近处
   float depth = 0.0f;
@@ -160,6 +160,7 @@ static Eigen::Matrix3f BuildWorldCovariance(const Eigen::Vector3f& scale,
 
   const Eigen::Matrix3f R = QuaternionToMatrix(rotation);
   const Eigen::Matrix3f M = S * R;
+  // const Eigen::Matrix3f M = R * S;
   return M.transpose() * M;
 }
 
@@ -205,11 +206,12 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     }
 
     // NDC 到像素坐标
-    const int px = static_cast<int>((ndc.x() * 0.5f + 0.5f) *
-                                    static_cast<float>(camera.width - 1));
-    const int py = static_cast<int>((ndc.y() * 0.5f + 0.5f) *
-                                    static_cast<float>(camera.height - 1));
-    if (px < 0 || px >= camera.width || py < 0 || py >= camera.height) {
+    const float px =
+        (ndc.x() * 0.5f + 0.5f) * static_cast<float>(camera.width - 1);
+    const float py =
+        (ndc.y() * 0.5f + 0.5f) * static_cast<float>(camera.height - 1);
+    if (px < 0.0f || px >= static_cast<float>(camera.width) || py < 0.0f ||
+        py >= static_cast<float>(camera.height)) {
       continue;
     }
 
@@ -223,7 +225,8 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
 
     // 相机协方差
     const Eigen::Matrix3f viewRot = camera.view.block<3, 3>(0, 0);
-    const Eigen::Matrix3f covView = viewRot * covWorld * viewRot.transpose();
+    // const Eigen::Matrix3f covView = viewRot * covWorld * viewRot.transpose();
+    const Eigen::Matrix3f covView = viewRot.transpose() * covWorld * viewRot;
 
     // 对齐官方 computeCov2D：
     // 先在相机空间限制 x/z 和 y/z 的斜率，避免极端透视把椭圆拉爆。
@@ -286,6 +289,23 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     const float conicB = invCov2D(0, 1);
     const float conicC = invCov2D(1, 1);
 
+    //// 对齐官方 forward.cu：
+    //// cov2D = [a b; b c]
+    // const float a = cov2D(0, 0);
+    // const float b = cov2D(0, 1);
+    // const float c = cov2D(1, 1);
+
+    // const float mid = 0.5f * (a + c);
+    // const float discr = std::max(0.1f, mid * mid - detAfter);
+
+    // const float lambda1 = mid + std::sqrt(discr);
+    // const float lambda2 = mid - std::sqrt(discr);
+    // const float lambdaMax = std::max(lambda1, lambda2);
+
+    //// 仍然保留 bbox 上限，避免个别高斯失控
+    // const int bboxRadius = std::clamp(
+    //    static_cast<int>(std::ceil(3.0f * std::sqrt(lambdaMax))), 1, 64);
+
     // 对齐官方 forward.cu：
     // cov2D = [a b; b c]
     const float a = cov2D(0, 0);
@@ -297,11 +317,38 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
 
     const float lambda1 = mid + std::sqrt(discr);
     const float lambda2 = mid - std::sqrt(discr);
-    const float lambdaMax = std::max(lambda1, lambda2);
 
-    // 仍然保留 bbox 上限，避免个别高斯失控
-    const int bboxRadius = std::clamp(
-        static_cast<int>(std::ceil(3.0f * std::sqrt(lambdaMax))), 1, 64);
+    // 主轴标准差（3 sigma 范围）
+    const float r1 = 3.0f * std::sqrt(std::max(lambda1, 0.0f));
+    const float r2 = 3.0f * std::sqrt(std::max(lambda2, 0.0f));
+
+    // 用特征分解求主轴方向
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> solver(cov2D);
+    if (solver.info() != Eigen::Success) {
+      ++stats.clippedBadEigen;
+      continue;
+    }
+
+    // Eigen 的特征值升序排列：
+    // eigenvectors.col(1) 对应较大的特征值 lambda1
+    // eigenvectors.col(0) 对应较小的特征值 lambda2
+    const Eigen::Vector2f majorAxis = solver.eigenvectors().col(1);
+    const Eigen::Vector2f minorAxis = solver.eigenvectors().col(0);
+
+    // 计算旋转椭圆在屏幕 x/y 轴上的投影半宽高
+    const float bboxHalfX =
+        std::sqrt((r1 * majorAxis.x()) * (r1 * majorAxis.x()) +
+                  (r2 * minorAxis.x()) * (r2 * minorAxis.x()));
+
+    const float bboxHalfY =
+        std::sqrt((r1 * majorAxis.y()) * (r1 * majorAxis.y()) +
+                  (r2 * minorAxis.y()) * (r2 * minorAxis.y()));
+
+    // 保留一个上限，避免极少数高斯失控
+    const int bboxRadiusX =
+        std::clamp(static_cast<int>(std::ceil(bboxHalfX)), 1, 64);
+    const int bboxRadiusY =
+        std::clamp(static_cast<int>(std::ceil(bboxHalfY)), 1, 64);
 
     // 计算 SH 颜色
     Eigen::Vector3f viewDir = point.position - cameraCenter;
@@ -311,25 +358,21 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     viewDir.normalize();
     const Eigen::Vector3f shColor = EvalSHColor(point.sh, viewDir);
 
-    //
-    // const float finalOpacity =
-    //    std::clamp(point.opacity * opacityScale, 0.0f, 1.0f);
-    const float opacityScaleBlend = 0.5f;
-    const float blendedOpacityScale =
-        1.0f + (opacityScale - 1.0f) * opacityScaleBlend;
     const float finalOpacity =
-        std::clamp(point.opacity * blendedOpacityScale, 0.0f, 1.0f);
+        std::clamp(point.opacity * opacityScale, 0.0f, 1.0f);
 
     //
     ++stats.projectedCount;
 
-    stats.minBBox = std::min(stats.minBBox, bboxRadius);
-    stats.maxBBox = std::max(stats.maxBBox, bboxRadius);
-    stats.sumBBox += static_cast<double>(bboxRadius);
+    const int bboxRadiusMax = std::max(bboxRadiusX, bboxRadiusY);
 
-    if (bboxRadius >= 16) ++stats.bboxGe16;
-    if (bboxRadius >= 32) ++stats.bboxGe32;
-    if (bboxRadius >= 64) ++stats.bboxGe64;
+    stats.minBBox = std::min(stats.minBBox, bboxRadiusMax);
+    stats.maxBBox = std::max(stats.maxBBox, bboxRadiusMax);
+    stats.sumBBox += static_cast<double>(bboxRadiusMax);
+
+    if (bboxRadiusMax >= 16) ++stats.bboxGe16;
+    if (bboxRadiusMax >= 32) ++stats.bboxGe32;
+    if (bboxRadiusMax >= 64) ++stats.bboxGe64;
 
     stats.minOpacity = std::min(stats.minOpacity, finalOpacity);
     stats.maxOpacity = std::max(stats.maxOpacity, finalOpacity);
@@ -340,8 +383,8 @@ static std::vector<ProjectedGaussian> PreprocessGaussians(
     p.px = px;
     p.py = py;
     p.depth = std::abs(viewPos.z());
-    p.radiusX = bboxRadius;
-    p.radiusY = bboxRadius;
+    p.radiusX = bboxRadiusX;
+    p.radiusY = bboxRadiusY;
     p.conicA = conicA;
     p.conicB = conicB;
     p.conicC = conicC;
@@ -369,10 +412,16 @@ static cv::Mat RasterizeGaussians(
   // 逐个椭圆 splat 到图像
   for (const ProjectedGaussian& point : gaussians) {
     // 先取 bbox 范围
-    const int minX = std::max(0, point.px - point.radiusX);
-    const int maxX = std::min(camera.width - 1, point.px + point.radiusX);
-    const int minY = std::max(0, point.py - point.radiusY);
-    const int maxY = std::min(camera.height - 1, point.py + point.radiusY);
+    const int minX =
+        std::max(0, static_cast<int>(std::floor(point.px - point.radiusX)));
+    const int maxX =
+        std::min(camera.width - 1,
+                 static_cast<int>(std::ceil(point.px + point.radiusX)));
+    const int minY =
+        std::max(0, static_cast<int>(std::floor(point.py - point.radiusY)));
+    const int maxY =
+        std::min(camera.height - 1,
+                 static_cast<int>(std::ceil(point.py + point.radiusY)));
 
     // 基础 alpha 和颜色
     const float alpha = std::clamp(point.opacity, 0.0f, 1.0f);
@@ -380,8 +429,11 @@ static cv::Mat RasterizeGaussians(
 
     for (int y = minY; y <= maxY; ++y) {
       for (int x = minX; x <= maxX; ++x) {
-        const float dx = static_cast<float>(x - point.px);
-        const float dy = static_cast<float>(y - point.py);
+        // const float dx = static_cast<float>(x - point.px);
+        // const float dy = static_cast<float>(y - point.py);
+
+        const float dx = (static_cast<float>(x) + 0.5f) - point.px;
+        const float dy = (static_cast<float>(y) + 0.5f) - point.py;
 
         // 椭圆二次型
         const float quad = point.conicA * dx * dx +
@@ -429,10 +481,14 @@ static std::vector<TileEntry> BuildTileEntries(
   for (int i = 0; i < static_cast<int>(gaussians.size()); ++i) {
     const ProjectedGaussian& g = gaussians[i];
 
-    const int minX = std::max(0, g.px - g.radiusX);
-    const int maxX = std::min(camera.width - 1, g.px + g.radiusX);
-    const int minY = std::max(0, g.py - g.radiusY);
-    const int maxY = std::min(camera.height - 1, g.py + g.radiusY);
+    const int minX =
+        std::max(0, static_cast<int>(std::floor(g.px - g.radiusX)));
+    const int maxX = std::min(camera.width - 1,
+                              static_cast<int>(std::ceil(g.px + g.radiusX)));
+    const int minY =
+        std::max(0, static_cast<int>(std::floor(g.py - g.radiusY)));
+    const int maxY = std::min(camera.height - 1,
+                              static_cast<int>(std::ceil(g.py + g.radiusY)));
 
     const int tileMinX = std::max(0, minX / kTileWidth);
     const int tileMaxX = std::min(tileCountX - 1, maxX / kTileWidth);
@@ -544,8 +600,11 @@ static cv::Mat RasterizeTiles(const std::vector<ProjectedGaussian>& gaussians,
               continue;
             }
 
-            const float dx = static_cast<float>(x - point.px);
-            const float dy = static_cast<float>(y - point.py);
+            // const float dx = static_cast<float>(x - point.px);
+            // const float dy = static_cast<float>(y - point.py);
+
+            const float dx = (static_cast<float>(x) + 0.5f) - point.px;
+            const float dy = (static_cast<float>(y) + 0.5f) - point.py;
 
             const float quad = point.conicA * dx * dx +
                                2.0f * point.conicB * dx * dy +

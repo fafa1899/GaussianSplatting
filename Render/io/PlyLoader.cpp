@@ -148,6 +148,9 @@ PointCloud PlyLoader::LoadPointCloud(const std::string& path) {
     cloud.points[vertex].rotation = Eigen::Vector4f(
         gaussianCloud[vertex].rot[0], gaussianCloud[vertex].rot[1],
         gaussianCloud[vertex].rot[2], gaussianCloud[vertex].rot[3]);
+    // cloud.points[vertex].rotation = Eigen::Vector4f(
+    //    gaussianCloud[vertex].rot[1], gaussianCloud[vertex].rot[2],
+    //    gaussianCloud[vertex].rot[3], gaussianCloud[vertex].rot[0]);
 
     auto& sh = cloud.points[vertex].sh;
     // 先放 DC
