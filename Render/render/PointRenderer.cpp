@@ -464,7 +464,8 @@ static std::vector<TileRange> BuildTileRanges(std::vector<TileEntry>& entries,
               if (a.tileId != b.tileId) {
                 return a.tileId < b.tileId;
               }
-              return a.depth > b.depth;  // 远到近
+              // return a.depth > b.depth;  // 远到近
+              return a.depth < b.depth;  // 近到远
             });
 
   std::vector<TileRange> ranges(tileCount);
@@ -496,8 +497,18 @@ static cv::Mat RasterizeTiles(const std::vector<ProjectedGaussian>& gaussians,
                               const std::vector<TileEntry>& entries,
                               const std::vector<TileRange>& ranges,
                               const Camera& camera) {
-  cv::Mat image(camera.height, camera.width, CV_32FC3,
-                cv::Scalar(20.0f / 255.0f, 20.0f / 255.0f, 20.0f / 255.0f));
+  const cv::Vec3f backgroundColor(20.0f / 255.0f, 20.0f / 255.0f,
+                                  20.0f / 255.0f);
+
+  cv::Mat finalImage(
+      camera.height, camera.width, CV_32FC3,
+      cv::Scalar(backgroundColor[0], backgroundColor[1], backgroundColor[2]));
+
+  cv::Mat transmittanceDebug(camera.height, camera.width, CV_32FC1,
+                             cv::Scalar(1.0f));
+
+  cv::Mat contribCountDebug(camera.height, camera.width, CV_32SC1,
+                            cv::Scalar(0));
 
   const int tileCountX = (camera.width + kTileWidth - 1) / kTileWidth;
   const int tileCountY = (camera.height + kTileHeight - 1) / kTileHeight;
@@ -515,20 +526,24 @@ static cv::Mat RasterizeTiles(const std::vector<ProjectedGaussian>& gaussians,
       const int tileMinY = ty * kTileHeight;
       const int tileMaxY = std::min(camera.height, tileMinY + kTileHeight);
 
-      for (int ei = range.begin; ei < range.end; ++ei) {
-        const ProjectedGaussian& point = gaussians[entries[ei].gaussianIndex];
+      // 改成：tile -> pixel -> gaussian
+      for (int y = tileMinY; y < tileMaxY; ++y) {
+        for (int x = tileMinX; x < tileMaxX; ++x) {
+          float T = 1.0f;
+          cv::Vec3f C(0.0f, 0.0f, 0.0f);
 
-        const int minX = std::max(tileMinX, point.px - point.radiusX);
-        const int maxX = std::min(tileMaxX - 1, point.px + point.radiusX);
-        const int minY = std::max(tileMinY, point.py - point.radiusY);
-        const int maxY = std::min(tileMaxY - 1, point.py + point.radiusY);
+          int contribCount = 0;
 
-        const float alpha = std::clamp(point.opacity, 0.0f, 1.0f);
-        const cv::Vec3f srcColor(point.color.z(), point.color.y(),
-                                 point.color.x());
+          for (int ei = range.begin; ei < range.end; ++ei) {
+            const ProjectedGaussian& point =
+                gaussians[entries[ei].gaussianIndex];
 
-        for (int y = minY; y <= maxY; ++y) {
-          for (int x = minX; x <= maxX; ++x) {
+            // 先做一个 bbox 粗筛，避免不必要计算
+            if (x < point.px - point.radiusX || x > point.px + point.radiusX ||
+                y < point.py - point.radiusY || y > point.py + point.radiusY) {
+              continue;
+            }
+
             const float dx = static_cast<float>(x - point.px);
             const float dy = static_cast<float>(y - point.py);
 
@@ -537,30 +552,73 @@ static cv::Mat RasterizeTiles(const std::vector<ProjectedGaussian>& gaussians,
                                point.conicC * dy * dy;
 
             const float power = -0.5f * quad;
-            if (power < -12.0f) {
+
+            // 对齐官方：power > 0 直接跳过
+            if (power > 0.0f) {
               continue;
             }
 
-            const float weight = std::exp(power);
-            if (weight < 1e-4f) {
+            const float alpha =
+                std::min(0.99f, point.opacity * std::exp(power));
+
+            if (alpha < (1.0f / 255.0f)) {
               continue;
             }
 
-            const float localAlpha = alpha * weight;
-            if (localAlpha <= 1e-4f) {
-              continue;
-            }
+            const float testT = T * (1.0f - alpha);
 
-            cv::Vec3f& dst = image.at<cv::Vec3f>(y, x);
-            dst = srcColor * localAlpha + dst * (1.0f - localAlpha);
+            C += cv::Vec3f(point.color.z(), point.color.y(), point.color.x()) *
+                 (alpha * T);
+
+            T = testT;
+
+            ++contribCount;
+
+            // 这里终于和官方语义更接近：
+            // 当前像素已经足够不透明，就停止处理后续 Gaussian
+            if (T < 1e-4f) {
+              break;
+            }
           }
+
+          finalImage.at<cv::Vec3f>(y, x) = C + backgroundColor * T;
+          transmittanceDebug.at<float>(y, x) = T;
+          contribCountDebug.at<int>(y, x) = contribCount;
         }
       }
     }
   }
 
   cv::Mat output;
-  image.convertTo(output, CV_8UC3, 255.0);
+  finalImage.convertTo(output, CV_8UC3, 255.0);
+
+  // Debug 1: transmittance，T 越小越黑，说明越早被吃光
+  cv::Mat transmittance8U;
+  transmittanceDebug.convertTo(transmittance8U, CV_8UC1, 255.0);
+  cv::imwrite(
+      R"(D:\3DGS\Unity3DGS\GaussianSplatting\Render\output\transmittance_debug.png)",
+      transmittance8U);
+
+  // Debug 2: contrib count，先归一化到 0~255 方便看
+  double minCount = 0.0;
+  double maxCount = 0.0;
+  cv::minMaxLoc(contribCountDebug, &minCount, &maxCount);
+
+  cv::Mat contribCount8U;
+  if (maxCount > 0.0) {
+    contribCountDebug.convertTo(contribCount8U, CV_8UC1, 255.0 / maxCount);
+  } else {
+    contribCount8U =
+        cv::Mat(camera.height, camera.width, CV_8UC1, cv::Scalar(0));
+  }
+
+  cv::imwrite(
+      R"(D:\3DGS\Unity3DGS\GaussianSplatting\Render\output\contrib_count_debug.png)",
+      contribCount8U);
+
+  std::cout << "Contrib count min/max: " << minCount << " / " << maxCount
+            << std::endl;
+
   return output;
 }
 
